@@ -12,43 +12,135 @@ comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 size = comm.Get_size()
 
-def general_max(*args):
-    if len(args)==1:
-        if isinstance(args[0],Raster):
-            return np.max(args[0].data)
+Symbol = str
+List = list
+Number = (int, float)
+
+def get_proc_dimensions(x_size, y_size):
+    displacement = (0, )
+    proc_data_size = ()
+    
+    normal_y_size = y_size/size
+    last_y_size = y_size - normal_y_size * (size-1)
+    y_size_list = [normal_y_size]*(size-1)
+    y_size_list.append(last_y_size)
+    proc_x_size = x_size
+
+    for i in range(size):
+        if i == size - 1:
+            proc_data_size = proc_data_size + (proc_x_size*last_y_size, )
+        else:
+            displacement = displacement +  (displacement[-1] + normal_y_size*proc_x_size, )
+            proc_data_size = proc_data_size + (proc_x_size*normal_y_size, )
+
+    return (proc_x_size, y_size_list, proc_data_size, displacement)
+
+def transfer_data(raster):
+    # print "scatter data"
+    displacement = (0,)
+    proc_data_size = ()
+    proc_x_size = 0
+    proc_y_size = 0
+    y_size_list = []
+    data = None
+
+    if rank == 0:
+        (proc_x_size, y_size_list, proc_data_size, displacement) = get_proc_dimensions(raster.x_size, raster.y_size)
+        data = raster.data
+    proc_y_size = comm.scatter(y_size_list, root=0)
+    proc_x_size = comm.bcast(proc_x_size, root=0)
+    comm.Barrier()
+    # print rank, proc_y_size, proc_x_size
+    proc_data = np.zeros((proc_x_size, proc_y_size), dtype=np.float32)
+    
+    comm.Scatterv([data, proc_data_size, displacement, MPI.FLOAT], proc_data)
+    comm.Barrier()
+    return proc_data 
+
+def gather_data(proc_data, x_size, y_size):
+    # print "gather data"
+    displacement = (0, )
+    proc_data_size = ()
+    if rank == 0:
+        (_, _, proc_data_size, displacement) = get_proc_dimensions(x_size, y_size)
+        data = np.zeros((x_size, y_size), dtype=np.float32)
     else:
-        return max(*args)
+        data = None
+    comm.Gatherv(proc_data, [data, proc_data_size, displacement, MPI.FLOAT])
+    comm.Barrier()
+    if rank == 0:
+        return data
+    else:
+        return None
 
-class File:
-    def __init__(self, name, data=None):
-        if not os.path.isfile(name):
-            if name == 'result':
-                open(self.name, 'w+')
-            else:
-                raise IOError("No such file as %s"%name)
-        self.name = name
-        self.data = data
+def general_max(*args):
+    if rank == 0:
+        if len(args)==1:
+            if isinstance(args[0],Raster) and args[0].data is not None:
+                return np.max(args[0].data)
+        else:
+            return max(*args)
+    else:
+        return 0
+def binary_op(x1, x2, op):
+    x_size = 0
+    y_size = 0
+    nodata = None
+    driver = None
+    georef = None
+    proj = None
+    if isinstance(x1, Number) and isinstance(x2, Number):
+        return op(x1, x2);
+    else:
+        if isinstance(x1, Raster):
+            if rank == 0:
+                (x_size, y_size) = x1.x_size, x1.y_size
+                (nodata, driver, georef, proj) = x1.get_geo_info()
+            x1 = transfer_data(x1)
+        if isinstance(x2, Raster):
+            if rank == 0:
+                (x_size, y_size) = x2.x_size, x2.y_size
+                (nodata, driver, georef, proj) = x2.get_geo_info()
+            x2 = transfer_data(x2)
+        proc_result = op(x1, x2)
+        proc_data = gather_data(proc_result, x_size, y_size)
+        comm.Barrier()
+    return Raster(None, proc_data, nodata, driver, georef, proj)
 
-class Raster(File):
+    
+def add(x1, x2):
+    return binary_op(x1, x2, np.add)
+def sub(x1, x2):
+    return binary_op(x1, x2, np.subtract)
+def mul(x1, x2):
+    return binary_op(x1, x2, np.multiply)
+def div(x1, x2):
+    return binary_op(x1, x2, np.divide)
+
+
+class Raster:
     
     def __init__(self, name, data=None, nodata=None, driver=None, georef=None, proj=None):
         "constructor for raster"
-        if name is None:
-            self.name = None
-            self.data = data
-            self.nodata = nodata
-            self.driver = driver
-            self.georef = georef
-            self.proj = proj
-            self.x_size = data.shape[1]
-            self.y_size = data.shape[0]
+        if rank == 0:
+            if name is None:        # intermidiate raster
+                self.name = None
+                self.data = data
+                self.nodata = nodata
+                self.driver = driver
+                self.georef = georef
+                self.proj = proj
+                self.x_size = None if data is None  else data.shape[0]
+                self.y_size = None if data is None else data.shape[1]
+            else:                   # empty raster 
+                if not os.path.isfile(name):
+                    self.name = name
+                else:               # raster already in file system
+                    self.name = name
+                    (self.data, self.x_size, self.y_size,
+                     self.nodata, self.driver, self.georef, self.proj) = read_raster(name)
         else:
-            if not os.path.isfile(name):
-                self.name = name
-            else:
-                self.name = name
-                (self.data, self.x_size, self.y_size,
-                 self.nodata, self.driver, self.georef, self.proj) = read_raster(name)
+            self.name = name
 
     def __repr__(self):
         return '<%s.%s object at %s>' % (
@@ -56,6 +148,11 @@ class Raster(File):
             self.__class__.__name__,
             hex(id(self))
         )
+
+        
+    def get_geo_info(self):
+        return (self.nodata, self.driver, self.georef, self.proj)
+
 
     def __str__(self):
         print self.__repr__()
@@ -81,47 +178,11 @@ class Raster(File):
         return Raster(None, result, self.nodata, self.driver, self.georef, self.proj)
     
     def __abs__(self):
-        result = np.absolute(self.data)
-        return Raster(None, result, self.nodata, self.driver, self.georef, self.proj)
-        
-    # def __sub__(self, other):
-    #     if isinstance(other, Raster):
-    #         result = self.data - other.data
-    #     elif isinstance(other[0], np.ndarray):
-    #         result = np.subtract(self.data, other)
-    #     else:
-    #         raise TypeError("only raster file can be subtract from raster file\n")
-    #     return ( result, self.x_size, self.y_size,
-    #              self.nodata, self.driver, self.georef, self.proj)
-        
-    # def __rsub__(self, other):
-    #     if isinstance(other, Raster):
-    #         result =  other.data - self.data
-    #     elif isinstance(other[0], np.ndarray):
-    #         result = np.subtract(other, self.data)
-    #     else:
-    #         raise TypeError("only raster file can be subtract from raster file\n")
-    #     return ( result, self.x_size, self.y_size,
-    #              self.nodata, self.driver, self.georef, self.proj)
-    # def __mul__(self, other):
-    #     if isinstance(other, Raster):
-    #         result = np.multiply(self.data, other.data)
-    #     elif isinstance(other[0], np.ndarray):
-    #         result = np.multiple(other, self.data)
-    #     else:
-    #         raise TypeError("only raster file can be multiply to raster file\n")
-    #     return ( result, self.x_size, self.y_size,
-    #              self.nodata, self.driver, self.georef, self.proj)
-    # def __rmul__(self, other):
-    #     if isinstance(other, Raster):
-    #         result = np.multiply(self.data, other.data)
-    #     elif isinstance(other, np.ndarray):
-    #         result = np.multiple(self.data, other)
-    #     else:
-    #         raise TypeError("only raster file can be multiply to raster file\n")
-    #     return ( result, self.x_size, self.y_size,
-    #              self.nodata, self.driver, self.georef, self.proj)
-
+        if rank == 0:
+            result = np.absolute(self.data)
+        else:
+            result = None
+        return Raster(None, result, self.nodata, self.driver, self.georef, self.proj)        
 
     def write_data(self, data, x_offset, y_offset, nodata,
               x_size, y_size, driver, georef, proj ):
@@ -136,12 +197,6 @@ class Raster(File):
                                 driver, georef, proj)
         write_raster(dataset, data, x_offset, y_offset, nodata)
         
-Symbol = str
-List = list
-Number = (int, float)
-
-
-
 class Procedure(object):
     "A user defined Scheme procedure."
     def __init__(self, parms, body, env):
@@ -165,7 +220,6 @@ def parse(program):
     return read_from_tokens(tokenize(program))
 
 def read_from_tokens(tokens):
-    print tokens
     if len(tokens) == 0:
         raise SyntaxError('unexppected EOF while reading')
     token = tokens.pop(0)
@@ -174,7 +228,7 @@ def read_from_tokens(tokens):
         while tokens[0] != ')':
             L.append(read_from_tokens(tokens))
         tokens.pop(0)
-        print L
+        # print L
         return L
     elif ')' == token:
         raise SyntaxError('unexpected )')
@@ -201,10 +255,9 @@ def standard_env():
     env = Env()
     env.update(vars(math)) # sin, cos, sqrt, pi, ...
     env.update({
-        '+':op.add, '-':op.sub, '*':op.mul, '/':op.div, 
+        '+':add, '-':sub, '*':mul, '/':div, 
         '>':op.gt, '<':op.lt, '>=':op.ge, '<=':op.le, '=':op.eq, 
         'abs':     abs,
-        'append':  op.add,  
         'apply':   apply,
         'begin':   lambda *x: x[-1],
         'car':     lambda x: x[0],
@@ -231,7 +284,7 @@ global_env = standard_env()
 
 def eval(x, env=global_env): 
     if isinstance(x, Symbol):
-        return env.find(x)[x]
+        return env.find(x)[x] 
     elif not isinstance(x, List):
         return x 
     elif x[0] == 'quote':
@@ -244,9 +297,10 @@ def eval(x, env=global_env):
     elif x[0] == 'define':
         (_, var, exp) = x
         result = eval(exp, env)
-        if isinstance(var, Raster):            
-            var.write_data(result.data, 0, 0, result.nodata, result.x_size, result.y_size, 
-                      result.driver, result.georef, result.proj)
+        if  isinstance(var, Raster):            
+            if rank == 0:
+                var.write_data(result.data, 0, 0, result.nodata, result.x_size, result.y_size, 
+                               result.driver, result.georef, result.proj)
             env[var.name] = var
             env[var] = var
         else:
@@ -254,11 +308,7 @@ def eval(x, env=global_env):
     elif x[0] == 'set!':
         (_, var, exp) = x
         result = eval(exp, env)
-        if isinstance(var, Raster):            
-            var.write_data(result.data, 0, 0, result.nodata, result.x_size, result.y_size, 
-                      result.driver, result.georef, result.proj)
-        else:
-            env.find(var)[var] = result
+        env.find(var)[var] = result
 
     elif x[0] == 'lambda':
         (_, parms, body) = x
@@ -278,15 +328,19 @@ def schemestr(exp):
 
 def repl(prompt='lis.py>'):
     "A prompt-read-eval-print loop."
+    parsed_str = None
     while True:
-        parsed_str = parse(raw_input(prompt))
-        print("start to eval")
+        if (rank == 0):        
+            parsed_str = parse(raw_input(prompt))
+        comm.Barrier()
+        parsed_str = comm.bcast(parsed_str, root = 0)
+        comm.Barrier()
         val = eval(parsed_str)
-        if val is not None:
+        comm.Barrier()
+        if rank == 0 and val is not None:
             print(schemestr(val))
 
 
 if __name__ =='__main__':
-    if rank == 0:
-        repl()
+    repl()
 
