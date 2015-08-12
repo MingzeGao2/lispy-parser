@@ -2,6 +2,7 @@ import os
 import os.path
 import time
 import numpy as np
+import sys
 
 from mpi4py import MPI
 
@@ -351,7 +352,26 @@ def repl(prompt='lis.py>'):
         if rank == 0 and val is not None:
             print(schemestr(val))
 
+def run_script(script):
+    parsed_str = None
+    lines = [line.rstrip('\n') for line in open(script)]
+    for line in lines:
+        if(rank == 0):
+            print line
+            parsed_str = parse(line)
+        comm.Barrier()
+        parsed_str = comm.bcast(parsed_str, root=0)
+        comm.Barrier()
+        val = eval(parsed_str)
+        comm.Barrier()
+        if rank == 0 and val is not None:
+            print "\nresult:"
+            print (schemestr(val))
+
 
 if __name__ =='__main__':
-    repl()
+    try:
+        run_script(sys.argv[1])
+    except:
+        repl()
 
