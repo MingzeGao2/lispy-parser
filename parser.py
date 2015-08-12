@@ -82,6 +82,17 @@ def general_max(*args):
             return max(*args)
     else:
         return 0
+def general_min(*args):
+    if rank == 0:
+        if len(args)==1:
+            if isinstance(args[0],Raster) and args[0].data is not None:
+                return np.min(args[0].data)
+        else:
+            return min(*args)
+    else:
+        return 0
+
+
 def binary_op(x1, x2, op):
     x_size = 0
     y_size = 0
@@ -270,7 +281,7 @@ def standard_env():
         'list?':   lambda x: isinstance(x,list), 
         'map':     map,
         'max':     general_max,
-        'min':     min,
+        'min':     general_min,
         'not':     op.not_,
         'null?':   lambda x: x == [], 
         'number?': lambda x: isinstance(x, Number),   
